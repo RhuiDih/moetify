@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moetify"
+dynamic = ["version"]
+description = "Create MOE LLM At Will"
+authors = [
+  {name = "RHUI DIH LEE", email = "rhui.dih.lee@ibm.com"},
+  {name = "LAURA WYNTER", email = "lwynter@sg.ibm.com"},
+]
+readme = "README.md"
+requires-python = "~=3.9"
+keywords = ['moetify']
+classifiers=[
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+dependencies = [
+    "transformers",
+    "peft",
+]
