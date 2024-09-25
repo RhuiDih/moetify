@@ -19,6 +19,7 @@ from .models.moe import *
 class MoetifyLoraConfig(LoraConfig):
     num_experts: int = field(default=8)
     gate_dimension: int = field(default=64)
+    global_router: bool = field(default=False)
     deep_router: bool = field(default=False)
     router_aux_loss_coef: float = field(default=0.00)
     router_norm: str = field(default="sigmoid")

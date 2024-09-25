@@ -42,6 +42,7 @@ def mix(
     lora_rank:int=64,
     lora_alpha:int=64,
     gate_dimension:int=128,
+    global_router:bool=False,
     deep_router:bool=False,
     router_aux_loss_coef:float=0.0,
     num_experts_per_tok:int=0,
@@ -85,6 +86,7 @@ def mix(
         gate_dimension=gate_dimension,
         num_experts=num_experts,
         target_modules=modules_to_mix,
+        global_router=global_router,
         deep_router=deep_router,
         router_aux_loss_coef=router_aux_loss_coef,
         router_norm = "sum" if decompose_base else "sigmoid",
@@ -255,6 +257,7 @@ if __name__ == "__main__":
     parser.add_argument('--modules', nargs='+', required=True)
     parser.add_argument('--num_samples', type=int, default=None)
     parser.add_argument('--deep_router', action="store_true", default=False)
+    parser.add_argument('--global_router', action="store_true", default=False)
     parser.add_argument('--decompose_base', action="store_true", default=False)
     parser.add_argument('--lora_rank', type=int, default=False)
     parser.add_argument('--lora_alpha', type=int, default=False)
@@ -268,6 +271,7 @@ if __name__ == "__main__":
         args.ingredients,
         args.modules,
         args.decompose_base,
+        global_router = args.global_router,
         deep_router = args.deep_router,
         lora_rank = args.lora_rank,
         lora_alpha = args.lora_alpha,

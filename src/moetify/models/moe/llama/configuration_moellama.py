@@ -4,9 +4,11 @@ from transformers.utils import logging
 
 from packaging import version
 
+from moetify.models.moe.configuration import MoeConfig
+
 logger = logging.get_logger(__name__)
 
-class MoeLlamaConfig(LlamaConfig):
+class MoeLlamaConfig(LlamaConfig, MoeConfig):
 
     model_type = "moellama"
 
@@ -25,6 +27,7 @@ class MoeLlamaConfig(LlamaConfig):
         jitter_noise=0.,
         always_on=False,
         deep_router=False,
+        global_router=False,
         gateless=False,
         **kwargs,
     ):
@@ -43,9 +46,11 @@ class MoeLlamaConfig(LlamaConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.jitter_noise = 0.
-        self.always_on = always_on
-        self.deep_router = deep_router
-        self.gateless = gateless
+        # deal with AutoConfig.fom_pretrained
+        self._always_on = always_on or kwargs.get("_always_on", False)
+        self._global_router = global_router or kwargs.get("_global_router", False)
+        self._deep_router = deep_router or kwargs.get("_deep_router", False)
+        self._gateless = gateless or kwargs.get("_gateless", False)
         if not moe_layer_idx:
             moe_layer_idx = list(range(self.num_hidden_layers))
         self.moe_layer_idx = moe_layer_idx

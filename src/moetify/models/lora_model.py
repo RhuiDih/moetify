@@ -30,6 +30,7 @@ class MoetifyLoraModel(LoraModel):
                 r = config.r,
                 lora_alpha = config.lora_alpha,
                 init_lora_weights = config.init_lora_weights,
+                global_router = config.global_router,
                 deep_router = config.deep_router,
                 store_router_logits = config.router_aux_loss_coef > 0.,
                 num_experts_per_tok = config.num_experts_per_tok,
@@ -51,7 +52,7 @@ class MoetifyLoraModel(LoraModel):
 
 class MixtureOfLinear(nn.Module, LoraLayer):
 
-    adapter_layer_names = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B", "lora_router")
+    adapter_layer_names = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
     other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout", "num_experts", "gate_dimension")
 
     def __init__(
@@ -63,6 +64,7 @@ class MixtureOfLinear(nn.Module, LoraLayer):
         r: int,
         lora_alpha: int,
         num_experts_per_tok: int,
+        global_router: bool,
         deep_router: bool,
         router_norm: str,
         lora_dropout: float = 0.0,
@@ -82,12 +84,16 @@ class MixtureOfLinear(nn.Module, LoraLayer):
 
         self.num_experts = num_experts
         self.gate_dimension = gate_dimension
+        self.global_router = global_router
         self.deep_router = deep_router
         self.store_router_logits = store_router_logits
 
-        self.lora_router = nn.ModuleDict({
-            adapter_name : nn.Linear(self.in_features, (self.num_experts), bias=False)
-        })
+        if not self.global_router:
+            self.lora_router = nn.ModuleDict({
+                adapter_name : nn.Linear(self.in_features, (self.num_experts), bias=False)
+            })
+            self.adapter_layer_names += ("lora_router",)
+        
         self.num_experts_per_tok = num_experts_per_tok
 
         if router_norm == "sum":
@@ -139,24 +145,30 @@ class MixtureOfLinear(nn.Module, LoraLayer):
         bs, seq, out_dim = base_out.size()
         torch_result_dtype = base_out.dtype
 
+        _x = x.view(-1, x.size(-1))
+
         for active_adapter in self.active_adapters:
 
-            out_proj = self.lora_router[active_adapter]
-
-            _x = x.view(-1, x.size(-1)).to(out_proj.weight.dtype)
-            router_out = out_proj(_x)
-
-            if self.deep_router:
-                router_out = router_out.view(-1, out_dim, self.num_experts)
-                if self.store_router_logits:
-                    self.router_logits = router_out.view(-1, out_dim, self.num_experts)
-            elif self.store_router_logits:
-                self.router_logits = router_out.view(-1, self.num_experts)
-
+            if not self.global_router:
+                router = self.lora_router[active_adapter]
+                router_out = router(_x.to(router.weight.dtype))
+                if self.deep_router:
+                    router_out = router_out.view(-1, out_dim, self.num_experts)
+                    if self.store_router_logits:
+                        self.router_logits = router_out.view(-1, out_dim, self.num_experts)
+                elif self.store_router_logits:
+                    self.router_logits = router_out.view(-1, self.num_experts)
+                routing_weights, selected_experts = torch.topk(router_out, self.num_experts_per_tok, dim=-1)
+                routing_weights =  self.router_norm(routing_weights)
+            else:
+                routing_weights = kwargs["routing_weights"]
+                selected_experts = kwargs["selected_experts"]
+            
             expert_adapter_names = self.active_expert_adapters(active_adapter)
             #_x = x.view(-1, x.size(-1)).to(self.lora_A[expert_adapter_names[0]].weight.dtype)
 
             experts_outputs = torch.zeros(bs*seq, out_dim, dtype=_x.dtype, device=_x.device)
+            """
             if self.num_experts_per_tok == self.num_experts:
                 router_out_norm =  self.router_norm(router_out)
                 for idx, expert_adapter in enumerate(expert_adapter_names):
@@ -165,34 +177,33 @@ class MixtureOfLinear(nn.Module, LoraLayer):
                         expert_weight = expert_weight.squeeze(-1)
                     experts_outputs += self.lora_forward(expert_adapter, _x) * expert_weight
             else:
-                routing_weights, selected_experts = torch.topk(router_out, self.num_experts_per_tok, dim=-1)
-                routing_weights =  self.router_norm(routing_weights)
-                #routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-                expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts) # bseq, (dim), topk, exp
-                if self.deep_router:
-                    expert_mask = expert_mask.permute(3,2,0,1) # exp, topk, bseq, out_feat
+            """
+            
+            expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts) # bseq, (dim), topk, exp
+            if self.deep_router:
+                expert_mask = expert_mask.permute(3,2,0,1) # exp, topk, bseq, out_feat
+            else:
+                expert_mask = expert_mask.permute(2,1,0) # exp, topk, bseq
+            for idx, expert_adapter in enumerate(expert_adapter_names):
+                if not self.deep_router:
+                    topk_idx, bseq_idx = torch.where(expert_mask[idx])
+                    if bseq_idx.shape[0] == 0:
+                        continue
+                    topk_idx_list = topk_idx.tolist()
+                    bseq_idx_list = bseq_idx.tolist()
+                    expert_weight = routing_weights[bseq_idx_list, topk_idx_list, None]
                 else:
-                    expert_mask = expert_mask.permute(2,1,0) # exp, topk, bseq
-                for idx, expert_adapter in enumerate(expert_adapter_names):
-                    if not self.deep_router:
-                        topk_idx, bseq_idx = torch.where(expert_mask[idx])
-                        if bseq_idx.shape[0] == 0:
-                            continue
-                        topk_idx_list = topk_idx.tolist()
-                        bseq_idx_list = bseq_idx.tolist()
-                        expert_weight = routing_weights[bseq_idx_list, topk_idx_list, None]
-                    else:
-                        topk_idx, bseq_idx, feat_idx = torch.where(expert_mask[idx])
-                        if feat_idx.shape[0] == 0:
-                            continue
-                        topk_idx_list = topk_idx.tolist()
-                        bseq_idx_list = bseq_idx.tolist()
-                        feat_idx_list = feat_idx.tolist()
-                        expert_weight = routing_weights[bseq_idx_list, feat_idx_list, topk_idx_list, None]
+                    topk_idx, bseq_idx, feat_idx = torch.where(expert_mask[idx])
+                    if feat_idx.shape[0] == 0:
+                        continue
+                    topk_idx_list = topk_idx.tolist()
+                    bseq_idx_list = bseq_idx.tolist()
+                    feat_idx_list = feat_idx.tolist()
+                    expert_weight = routing_weights[bseq_idx_list, feat_idx_list, topk_idx_list, None]
 
-                    _x_filtered = _x[None, bseq_idx_list].reshape(-1, _x.size(-1))
-                    _x_filtered = self.lora_forward(expert_adapter, _x_filtered) * expert_weight
-                    experts_outputs.index_add_(0, bseq_idx, _x_filtered.to(experts_outputs.dtype))
+                _x_filtered = _x[None, bseq_idx_list].reshape(-1, _x.size(-1))
+                _x_filtered = self.lora_forward(expert_adapter, _x_filtered) * expert_weight
+                experts_outputs.index_add_(0, bseq_idx, _x_filtered.to(experts_outputs.dtype))
                 
             #experts_outputs = torch.stack(experts_outputs, dim=2)  # bs, seq, num_experts, out_features
             #experts_outputs *= experts_weights.unsqueeze(-1)

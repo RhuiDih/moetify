@@ -808,3 +808,114 @@ def apply_fg_mlp_moe(
 
     return out_hidden_states
 
+def fused_experts_linear(
+    hidden_states: torch.Tensor,
+    w: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    override_config: Optional[Dict[str, Any]] = None,
+    use_fp8_w8a8: bool = False,
+    use_int8_w8a16: bool = False,
+    w_scale: Optional[torch.Tensor] = None,
+    a_scale: Optional[torch.Tensor] = None,
+    ):
+    
+    # Check constraints.
+    """
+    assert hidden_states.shape[1] == w.shape[2], "Hidden size mismatch"
+    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+    assert w.is_contiguous(), "Expert weights1 must be contiguous"
+    assert hidden_states.dtype in [
+        torch.float32, torch.float16, torch.bfloat16
+    ]
+    """
+
+    num_tokens, _ = hidden_states.shape
+    num_experts, _out_size, _in_size = w.shape # could be TP!
+
+    top_k = topk_ids.shape[1]
+    # We execute the fused_moe kernel in chunks to circumvent this issue:
+    # https://github.com/vllm-project/vllm/issues/5938
+    CHUNK_SIZE = envs.VLLM_FUSED_MOE_CHUNK_SIZE
+    M = min(num_tokens, CHUNK_SIZE)
+
+    config_dtype = get_config_dtype_str(
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        dtype=hidden_states.dtype
+    )
+    get_config_func = functools.partial(
+        try_get_optimal_moe_config,
+        w.shape,
+        w.shape,
+        top_k,
+        config_dtype,
+        override_config=override_config,
+    )
+
+    config = get_config_func(M)
+
+    intermediate_cache = torch.empty(
+        (M, top_k, _out_size),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype
+    )
+
+    out_tensor = torch.empty(
+        (num_tokens, _out_size),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype
+    )
+
+    compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+
+    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
+        begin_chunk_idx, end_chunk_idx = (chunk * CHUNK_SIZE,
+                                          min((chunk + 1) * CHUNK_SIZE,
+                                              num_tokens))
+        curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
+        tokens_in_chunk, _ = curr_hidden_states.shape
+
+        if tokens_in_chunk == 0:
+            break
+
+        if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
+            # Adjust the intermediate cache size and config for the last
+            # chunk. Note that in most cases we only have one chunk
+            # so the cache size and config are already set correctly and
+            # do not need to be adjusted.
+            intermediate_cache = intermediate_cache[:tokens_in_chunk]
+            config = get_config_func(tokens_in_chunk)
+
+        curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
+        curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'], num_experts)
+        )
+        invoke_fused_moe_kernel(
+            curr_hidden_states,
+            w,
+            intermediate_cache,
+            a_scale,
+            w_scale,
+            topk_weights=curr_topk_weights,
+            topk_ids=curr_topk_ids,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=True,
+            top_k=top_k,
+            config=config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a16=use_int8_w8a16
+        )
+        
+        torch.sum(
+            intermediate_cache.view(*intermediate_cache.shape),
+            dim=1,
+            out=out_tensor[begin_chunk_idx:end_chunk_idx]
+        )
+
+    return out_tensor

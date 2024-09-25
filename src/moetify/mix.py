@@ -1,4 +1,4 @@
-import os, logging, shutil, inspect
+import os, logging
 from typing import List
 from tqdm import tqdm
 import gc
@@ -8,6 +8,7 @@ from transformers import (
     set_seed,
     AutoConfig,
     AutoModelForCausalLM,
+    AutoTokenizer,
     LlamaForCausalLM,
     MistralForCausalLM
 )
@@ -29,18 +30,20 @@ MODELS_MOE_CLASS = {
 ROUTERS_NAME = ".router"
 EXPERTS_NAME = ".experts."
 
-                            
+
 @torch.no_grad()
 def mix(
     base_model:str,
     ingredients:List[str],
     modules_to_mix:List[str],
+    output_dir:str,
     positive_tokens:List[str]=[],
     num_samples:int=1000,
     num_experts_per_tok:int=2,
     moe_layer_idx:list=[],
     router_base_init:bool=False,
     gateless:bool=False,
+    global_router:bool=False,
     deep_router:bool=False,
     always_on:bool=False,
     merge_base:bool=False,
@@ -85,6 +88,7 @@ def mix(
         moe_value="v_proj" in modules_to_mix,
         num_experts_per_tok=num_experts_per_tok,
         moe_layer_idx=moe_layer_idx,
+        global_router=global_router,
         deep_router=deep_router,
         gateless=gateless,
         always_on=always_on,
@@ -266,9 +270,25 @@ def mix(
     logging.info("MOE total parameters : {}".format(model_info["total_param"]))
     logging.info("MOE active parameters: {}".format(model_info["active_param"]))
 
-    return moe_model.to(torch.float16), model_info
+    logging.info("Saving model...")
+    AutoTokenizer.from_pretrained(base_model).save_pretrained(output_dir)
+    moe_model.to(torch.bfloat16).save_pretrained(output_dir)
 
+    config_module_path = MOE_CFG_CLS.__module__
+    config_file_path = os.path.join(output_dir, config_module_path.split(".")[-1] + ".py")
+    model_module_path = MOE_MODEL_CLS.__module__
+    model_file_path = os.path.join(output_dir, model_module_path.split(".")[-1] + ".py")
+    assert os.path.exists(config_file_path)
+    assert os.path.exists(model_file_path)
+    with open(config_file_path, "w") as s:
+        s.write("from {} import *".format(config_module_path))
+    with open(model_file_path, "w") as s:
+        s.write("from {} import *".format(model_module_path))
+    logging.info("Done!")
+    
+    return moe_model, model_info
 
+from transformers import DataCollatorForSeq2Seq
 if __name__ == "__main__":
 
     import argparse, os, inspect
@@ -286,20 +306,23 @@ if __name__ == "__main__":
     parser.add_argument('--moe_layer_idx', nargs='+', default=[])
     parser.add_argument('--num_samples', type=int, default=None)
     parser.add_argument('--num_experts_per_tok', type=int, default=2)
+    parser.add_argument('--global_router', action="store_true", default=False)
     parser.add_argument('--deep_router', action="store_true", default=False)
     parser.add_argument('--mlp_fg', action="store_true", default=False)
     parser.add_argument('--gateless', action="store_true", default=False)
     parser.add_argument('--router_base_init', action="store_true", default=False)
     parser.add_argument('--merge_base', action="store_true", default=False)
     args = parser.parse_args()
-    
+
     model, model_info = mix(
         args.model_path,
         args.ingredients,
         args.modules,
+        args.output_dir,
         args.positive_tokens,
         args.num_samples,
         moe_layer_idx=args.moe_layer_idx,
+        global_router=args.global_router,
         deep_router=args.deep_router,
         gateless=args.gateless,
         always_on=args.always_on,
@@ -308,10 +331,7 @@ if __name__ == "__main__":
         router_base_init=args.router_base_init,
         merge_base=args.merge_base
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    model.save_pretrained(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    
+
     import json
     with open(os.path.join(args.output_dir, "model_info.json"), "w") as f:
         json.dump(model_info, f)

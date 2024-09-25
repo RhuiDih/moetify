@@ -4,17 +4,124 @@ import collections
 
 import torch
 
+import peft
 from peft.peft_model import PeftModelForCausalLM
 from peft.peft_model import SAFETENSORS_WEIGHTS_NAME, WEIGHTS_NAME, id_tensor_storage
-from peft.utils.other import EMBEDDING_LAYER_NAMES
-from peft.utils import infer_device, load_peft_weights
+from peft.utils.other import EMBEDDING_LAYER_NAMES, check_file_exists_on_hf_hub
+from peft.utils import infer_device, load_peft_weights, save_and_load
 
 from safetensors.torch import save_file as safe_save_file
 
 
+has_valid_embedding_base_layer = save_and_load.has_valid_embedding_base_layer
+get_embedding_layer_name = save_and_load.get_embedding_layer_name
+
 moetify_LORA = "moetify_LORA"
 moetify_IA3 = "moetify_IA3"
 moetify_METHODS = [moetify_LORA, moetify_IA3]
+
+old_get_peft_model_state_dict = save_and_load.get_peft_model_state_dict
+def get_moetify_peft_model_state_dict(
+    model, state_dict=None, adapter_name="default", unwrap_compiled=False, save_embedding_layers="auto"
+):
+    if unwrap_compiled:
+        model = getattr(model, "_orig_mod", model)
+    
+    config = model.peft_config[adapter_name]
+    if state_dict is None:
+        state_dict = model.state_dict()
+
+    if config.peft_type in moetify_LORA:
+        prefix = model.prefix
+        bias = config.bias
+        if bias == "none":
+            to_return = {k: state_dict[k] for k in state_dict if prefix in k}
+        elif bias == "all":
+            to_return = {k: state_dict[k] for k in state_dict if prefix in k or "bias" in k}
+        elif bias == "lora_only":
+            to_return = {}
+            for k in state_dict:
+                if prefix in k:
+                    to_return[k] = state_dict[k]
+                    bias_name = k.split(prefix)[0] + "bias"
+                    if bias_name in state_dict:
+                        to_return[bias_name] = state_dict[bias_name]
+        else:
+            raise NotImplementedError
+        to_return = {k: v for k, v in to_return.items() if ((prefix in k and adapter_name in k) or ("bias" in k))}
+            
+    elif config.peft_type == moetify_IA3:
+        to_return = {k: state_dict[k] for k in state_dict if prefix in k}
+    else:
+        return old_get_peft_model_state_dict(model, state_dict, adapter_name, unwrap_compiled, save_embedding_layers)
+
+    # MODULES TO SAVE
+    if getattr(model, "modules_to_save", None) is not None:
+        for key, value in state_dict.items():
+            if any(f"{module_name}.modules_to_save.{adapter_name}" in key for module_name in model.modules_to_save):
+                to_return[key.replace("modules_to_save.", "")] = value
+
+    # DEAL WITH EMBEDDINGS
+    # check the common embedding layers in `target_modules` to reset `save_embedding_layers` if necessary
+    is_embedding_in_target_modules = False
+    if (
+        save_embedding_layers == "auto"
+        and hasattr(config, "target_modules")
+        and any(k in config.target_modules for k in EMBEDDING_LAYER_NAMES)
+    ):
+        warnings.warn("Setting `save_embedding_layers` to `True` as embedding layers found in `target_modules`.")
+        save_embedding_layers = is_embedding_in_target_modules = True
+    elif save_embedding_layers == "auto":
+        vocab_size = getattr(getattr(model, "config", None), "vocab_size", None)
+        model_id = getattr(config, "base_model_name_or_path", None)
+
+        # For some models e.g. diffusers the text config file is stored in a subfolder
+        # we need to make sure we can download that config.
+        has_base_config = False
+
+        # ensure that this check is not performed in HF offline mode, see #1452
+        if model_id is not None:
+            local_config_exists = os.path.exists(os.path.join(model_id, "config.json"))
+            exists = local_config_exists or check_file_exists_on_hf_hub(model_id, "config.json")
+            if exists is None:
+                # check failed, could not determine if it exists or not
+                warnings.warn(
+                    f"Could not find a config file in {model_id} - will assume that the vocabulary was not modified."
+                )
+                has_base_config = False
+            else:
+                has_base_config = exists
+
+        # check if the vocab size of the base model is different from the vocab size of the finetuned model
+        if (
+            vocab_size
+            and model_id
+            and has_base_config
+            and (vocab_size != model.config.__class__.from_pretrained(model_id).vocab_size)
+        ):
+            warnings.warn(
+                "Setting `save_embedding_layers` to `True` as the embedding layer has been resized during finetuning."
+            )
+            save_embedding_layers = True
+        else:
+            save_embedding_layers = False
+
+    if save_embedding_layers and hasattr(model, "get_input_embeddings"):
+        for layer in [model.get_input_embeddings(), model.get_output_embeddings()]:
+            if not is_embedding_in_target_modules or has_valid_embedding_base_layer(layer):
+                # support from version >= 0.6.2
+                embedding_module_name = get_embedding_layer_name(model, layer, is_embedding_in_target_modules)
+                if embedding_module_name:
+                    to_return.update({k: v for k, v in state_dict.items() if embedding_module_name in k})
+    elif save_embedding_layers:
+        warnings.warn("Could not identify embedding layer(s) because the model is not a 🤗 transformers model.")
+
+    # REMOVE ADAPTER NAME
+    to_return = {k.replace(f".{adapter_name}", ""): v for k, v in to_return.items()}
+    return to_return
+
+peft.get_peft_model_state_dict = get_moetify_peft_model_state_dict
+save_and_load.get_peft_model_state_dict = get_moetify_peft_model_state_dict
 
 class MoetifyModelForCausalLM(PeftModelForCausalLM):
 
